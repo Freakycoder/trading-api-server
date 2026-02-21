@@ -2,22 +2,24 @@ use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener};
 use tonic::transport::Channel;
 use tonic::Request;
-use axum::{Json, Router, extract::State, routing::post};
-use orderbook_proto::{CancelOrderRequest, CancelOrderResponse, ModifyOrderRequest, ModifyOrderResponse, NewOrderRequest, NewOrderResponse, OrderBookClient, orders::OrderType};
+use axum::{Json, Router, extract::{State}, routing::{get, post}};
+use orderbook_proto::{CancelOrderRequest, CancelOrderResponse, ModifyOrderRequest, ModifyOrderResponse, NewOrderRequest, NewOrderResponse, OrderBookClient, orders::OrderType, BookRequest};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), anyhow::Error> {
 
-    let client = OrderBookClient::connect("http://[::1]:50051").await.unwrap();
+    let client = OrderBookClient::connect("http://[::1]:50051").await?;
 
     let app = Router::new()
     .route("/new", post(new_order))
     .route("/modify", post(modify_order))
     .route("/cancel", post(cancel_order))
+    .route("/depth", get(depth))
     .with_state(client);
     
     let listener = TcpListener::bind("127.0.0.1:8000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
+    Ok(())
 }
 
 async fn new_order(
@@ -63,6 +65,44 @@ async fn cancel_order(
     let response = client.cancel_order(cancel_request).await.unwrap().into_inner();
     let converted_res = CancelOrderRes::from(response);
     Json(converted_res)
+}
+
+async fn depth(
+    State(mut client) : State<OrderBookClient<Channel>>,
+    Json(request) : Json<DepthReq>
+) -> Json<DepthRes>{
+    let req = request;
+    let level_count = if req.level_count.unwrap() == 0{
+        None
+    } else {
+        req.level_count
+    };
+    let depth_request = Request::new(BookRequest{
+        security_name : req.security_name,
+        level_count
+    });
+    let response = client.book_depth(depth_request).await.unwrap().into_inner();
+    let book_depth = response.book_depth;
+    match book_depth{
+        Some(book) => {
+            println!("-------ASK-------");
+            for e in &book.ask_depth{
+                println!("[price = {}, quantity = {}]", e.price,e.quantity)
+            }
+            println!("------BID------");
+            for e in &book.bid_depth{
+                println!("[price = {}, quantity = {}]", e.price,e.quantity)
+            }
+            Json(DepthRes{
+                status : 200,
+                output : "book recieved".to_string()
+            })
+        }
+        None => {
+            println!("book is empty");
+            Json(DepthRes { status: 400, output: "orderbook is empty".to_string() })
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,4 +164,16 @@ impl From<CancelOrderResponse> for CancelOrderRes {
     fn from(value: CancelOrderResponse) -> Self {
         Self { order_id : value.order_id, status : value.status, output : value.cause}
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DepthReq{
+    security_name : String,
+    level_count : Option<u32>
+}
+
+#[derive(Debug, Serialize)]
+pub struct DepthRes{
+    status : u32,
+    output : String
 }
