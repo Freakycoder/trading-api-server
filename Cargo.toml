@@ -1,0 +1,11 @@
+[package]
+name = "api-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.8"
+orderbook-proto = "0.1.2"
+serde = {version = "1.0.228", features = ["derive"]}
+tokio = {version = "1.49.0", features = ["rt-multi-thread", "sync"]}
+tonic = "0.14.5"
