@@ -44,10 +44,13 @@ async fn modify_order(
     State(mut client) : State<OrderBookClient<Channel>>, 
     Json(request) : Json<ModifyOrder>) -> Json<ModifyOrderRes>{
         let req = request;
+        let new_price = if req.new_price.unwrap() == 0 {None} else { req.new_price};
+        let new_quantity = if req.new_quantity.unwrap() == 0 {None} else { req.new_quantity};
+
         let modify_request = Request::new(ModifyOrderRequest {
             order_id : req.order_id,
-            new_price : req.new_price,
-            new_quantity : req.new_quantity,
+            new_price,
+            new_quantity,
             side : req.is_buy_side
         });
     let response = client.modify_order(modify_request).await.unwrap().into_inner();
