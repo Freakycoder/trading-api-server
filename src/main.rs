@@ -98,12 +98,15 @@ async fn modify_order(
 async fn cancel_order(
     State(mut client) : State<OrderBookClient<Channel>>,
     Json(request) : Json<CancelOrder>) -> Json<CancelOrderRes> {
+        let start_time = Instant::now();
         let req = request;
         let cancel_request = Request::new(CancelOrderRequest{
             order_id : req.order_id
         });
     let response = client.cancel_order(cancel_request).await.unwrap().into_inner();
     let converted_res = CancelOrderRes::from(response);
+    let total_time = start_time.elapsed().as_millis() as f64;
+    CANCEL_ORDER_TOTAL_DURATION.with_label_values(&[converted_res.status.to_string()]).observe(total_time);
     Json(converted_res)
 }
 
