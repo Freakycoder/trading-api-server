@@ -1,13 +1,43 @@
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener};
 use tonic::transport::Channel;
 use tonic::Request;
 use axum::{Json, Router, extract::{State}, routing::{get, post}};
 use orderbook_proto::{CancelOrderRequest, CancelOrderResponse, ModifyOrderRequest, ModifyOrderResponse, NewOrderRequest, NewOrderResponse, OrderBookClient, orders::OrderType, BookRequest};
+use prometheus::{HistogramOpts, HistogramVec};
+use lazy_static::lazy_static;
+
+lazy_static!(
+    static ref NEW_ORDER_TOTAL_DURATION : HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "new_order_total_duration_ms", 
+            "total time from http request to response for new order")
+        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]), 
+        &["order-type", "status"]
+    ).unwrap();
+
+    static ref CANCEL_ORDER_TOTAL_DURATION : HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "cancel_order_total_duration_ms", 
+            "total time from http request to response for cancel order")
+        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]), 
+        &["status"]
+    ).unwrap();
+
+    static ref MODIFY_ORDER_TOTAL_DURATION : HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "modify_order_total_duration_ms", 
+            "total time from http request to response for modify order")
+        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]), 
+        &["status"]
+    ).unwrap();
+);
+
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-
     let client = OrderBookClient::connect("http://[::1]:50051").await?;
 
     let app = Router::new()
@@ -25,6 +55,7 @@ async fn main() -> Result<(), anyhow::Error> {
 async fn new_order(
     State(mut client) : State<OrderBookClient<Channel>>, // axum clones the client instance for us over here.
     Json(request) : Json<NewOrder>, ) -> Json<NewOrderRes>{
+        let start_time = Instant::now();
         let req = request;
         let order_request = Request::new(NewOrderRequest{
             user_id : None,
@@ -37,12 +68,16 @@ async fn new_order(
         
         let response = client.new_order(order_request).await.unwrap().into_inner();
         let res_to_send = NewOrderRes::from(response);
+        let total_duration = start_time.elapsed().as_millis() as f64;
+        NEW_ORDER_TOTAL_DURATION.with_label_values(&["New Order", "success"]).observe(total_duration);
         Json(res_to_send)
 }
 
 async fn modify_order(
     State(mut client) : State<OrderBookClient<Channel>>, 
     Json(request) : Json<ModifyOrder>) -> Json<ModifyOrderRes>{
+        let start_time = Instant::now();
+       
         let req = request;
         let new_price = if req.new_price.unwrap() == 0 {None} else { req.new_price};
         let new_quantity = if req.new_quantity.unwrap() == 0 {None} else { req.new_quantity};
@@ -55,6 +90,8 @@ async fn modify_order(
         });
     let response = client.modify_order(modify_request).await.unwrap().into_inner();
     let converted_res = ModifyOrderRes::from(response);
+    let total_time = start_time.elapsed().as_millis() as f64;
+    MODIFY_ORDER_TOTAL_DURATION.with_label_values(&[converted_res.status.to_string()]).observe(total_time);
     Json(converted_res) 
 
 }
