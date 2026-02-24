@@ -33,6 +33,14 @@ lazy_static!(
         .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]), 
         &["status"]
     ).unwrap();
+
+    static ref DEPTH_TOTAL_DURATION : HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "depth_total_duration_ms", 
+            "total time from http request to response for depth")
+        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]), 
+        &["asset_name", "status"]
+    ).unwrap();
 );
 
 
@@ -114,7 +122,9 @@ async fn depth(
     State(mut client) : State<OrderBookClient<Channel>>,
     Json(request) : Json<DepthReq>
 ) -> Json<DepthRes>{
+    let start_time = Instant::now();
     let req = request;
+    let security_name = req.security_name.clone();
     let level_count = if req.level_count.unwrap() == 0{
         None
     } else {
@@ -126,8 +136,10 @@ async fn depth(
     });
     let response = client.book_depth(depth_request).await.unwrap().into_inner();
     let book_depth = response.book_depth;
+    let total_time = start_time.elapsed().as_millis() as f64;
     match book_depth{
         Some(book) => {
+            DEPTH_TOTAL_DURATION.with_label_values(&[security_name, 200.to_string()]).observe(total_time);
             println!("-------ASK-------");
             for e in &book.ask_depth{
                 println!("[price = {}, quantity = {}]", e.price,e.quantity)
@@ -142,6 +154,7 @@ async fn depth(
             })
         }
         None => {
+            DEPTH_TOTAL_DURATION.with_label_values(&[security_name, 400.to_string()]).observe(total_time);
             println!("book is empty");
             Json(DepthRes { status: 400, output: "orderbook is empty".to_string() })
         }
