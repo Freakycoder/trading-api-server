@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{time::Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener};
@@ -6,7 +6,7 @@ use tonic::transport::Channel;
 use tonic::Request;
 use axum::{Json, Router, extract::{State}, routing::{get, post}};
 use orderbook_proto::{CancelOrderRequest, CancelOrderResponse, ModifyOrderRequest, ModifyOrderResponse, NewOrderRequest, NewOrderResponse, OrderBookClient, orders::OrderType, BookRequest};
-use prometheus::{HistogramOpts, HistogramVec, IntCounter, Registry};
+use prometheus::{HistogramOpts, HistogramVec, IntCounter, Registry, TextEncoder};
 use lazy_static::lazy_static;
 
 lazy_static!(
@@ -68,7 +68,7 @@ async fn main() -> Result<(), anyhow::Error> {
     .route("/modify", post(modify_order))
     .route("/cancel", post(cancel_order))
     .route("/depth", get(depth))
-    .route("/metric", get(|_| println!("")))
+    .route("/metric", get(metric))
     .with_state(shared_state);
     
     let listener = TcpListener::bind("127.0.0.1:8000").await.unwrap();
@@ -179,6 +179,12 @@ async fn depth(
             Json(DepthRes { status: 400, output: "orderbook is empty".to_string() })
         }
     }
+}
+
+async fn metric(State(shared_state): State<SharedState>) -> String{
+    let metric_families = shared_state.registry.gather();
+    let encoder = TextEncoder::new();
+    encoder.encode_to_string(&metric_families).unwrap()
 }
 
 #[derive(Debug, Deserialize)]
