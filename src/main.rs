@@ -15,7 +15,7 @@ lazy_static!(
             "new_order_total_duration_ms", 
             "total time from http request to response for new order")
         .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]), 
-        &["order-type", "status"]
+        &["order_type", "status"]
     ).unwrap();
 
     static ref CANCEL_ORDER_TOTAL_DURATION : HistogramVec = HistogramVec::new(
@@ -63,15 +63,20 @@ impl SharedState {
 async fn main() -> Result<(), anyhow::Error> {
 
     let shared_state = SharedState::new().await?;
+    let _ = shared_state.registry.register(Box::new(NEW_ORDER_TOTAL_DURATION.clone()));
+    let _ = shared_state.registry.register(Box::new(CANCEL_ORDER_TOTAL_DURATION.clone()));
+    let _ = shared_state.registry.register(Box::new(MODIFY_ORDER_TOTAL_DURATION.clone()));
+    let _ = shared_state.registry.register(Box::new(REQUEST_COUNTER.clone()));
+
     let app = Router::new()
     .route("/new", post(new_order))
     .route("/modify", post(modify_order))
     .route("/cancel", post(cancel_order))
     .route("/depth", get(depth))
-    .route("/metric", get(metric))
+    .route("/metrics", get(metric))
     .with_state(shared_state);
     
-    let listener = TcpListener::bind("127.0.0.1:8000").await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:8000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
     Ok(())
 }
@@ -182,6 +187,8 @@ async fn depth(
 }
 
 async fn metric(State(shared_state): State<SharedState>) -> String{
+    let _ = shared_state.registry.register(Box::new(NEW_ORDER_TOTAL_DURATION.clone()));
+    
     let metric_families = shared_state.registry.gather();
     let encoder = TextEncoder::new();
     encoder.encode_to_string(&metric_families).unwrap()
