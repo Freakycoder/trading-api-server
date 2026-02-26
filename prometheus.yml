@@ -1,0 +1,12 @@
+# prometheus.yml
+global:
+  scrape_interval: 5s      # How often to scrape metrics
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Scrape your Axum API server
+  - job_name: 'axum-api-server'
+    static_configs:
+      - targets: ['host.docker.internal:8000']
+        labels:
+          service: 'api-gateway'
