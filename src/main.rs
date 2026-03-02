@@ -98,7 +98,8 @@ async fn new_order(
         let response = shared_state.client.new_order(order_request).await.unwrap().into_inner();
         let res_to_send = NewOrderRes::from(response);
         let total_duration = start_time.elapsed().as_millis() as f64;
-        NEW_ORDER_TOTAL_DURATION.with_label_values(&["New Order", "success"]).observe(total_duration);
+        let order_type = if req.is_buy_side {"buy"} else {"sell"};
+        NEW_ORDER_TOTAL_DURATION.with_label_values(&[order_type, &res_to_send.status.to_string()]).observe(total_duration);
         REQUEST_COUNTER.inc();
         Json(res_to_send)
 }
