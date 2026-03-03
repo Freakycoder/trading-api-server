@@ -86,7 +86,7 @@ async fn new_order(
     Json(request) : Json<NewOrder>, ) -> Json<NewOrderRes>{
         let start_time = Instant::now();
         let req = request;
-        if req.price.unwrap() == 0 {
+        if req.price.unwrap() == 0 && req.order_type == "limit" {
             return Json(NewOrderRes{
                 order_id : "none".to_string(),
                 status : 400,
