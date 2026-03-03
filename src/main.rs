@@ -86,13 +86,29 @@ async fn new_order(
     Json(request) : Json<NewOrder>, ) -> Json<NewOrderRes>{
         let start_time = Instant::now();
         let req = request;
+        if req.price.unwrap() == 0 {
+            return Json(NewOrderRes{
+                order_id : "none".to_string(),
+                status : 400,
+                order_index : None,
+                cause : Some("Price cannot be 0".to_string())
+            });
+        }
+        if req.quantity == 0 {
+            return Json(NewOrderRes{
+                order_id : "none".to_string(),
+                status : 400,
+                order_index : None,
+                cause : Some("Quantity cannot be 0".to_string())
+            });
+        }
         let order_request = Request::new(NewOrderRequest{
             user_id : None,
             price : req.price,
             quantity : req.quantity,
             is_buy_side : req.is_buy_side,
             security_name : req.security_name,
-            order_type : OrderType::Market as i32
+            order_type : if req.order_type == "market"{ OrderType::Market as i32} else {OrderType::Limit as i32}
         });
         
         let response = shared_state.client.new_order(order_request).await.unwrap().into_inner();
@@ -201,6 +217,7 @@ pub struct NewOrder{
     pub quantity : u32,
     pub is_buy_side : bool,
     pub security_name : String,
+    pub order_type : String
 }
 
 #[derive(Debug, Serialize)]
