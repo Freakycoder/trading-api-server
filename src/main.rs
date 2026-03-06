@@ -111,13 +111,25 @@ async fn new_order(
             order_type : if req.order_type == "market"{ OrderType::Market as i32} else {OrderType::Limit as i32}
         });
         
-        let response = shared_state.client.new_order(order_request).await.unwrap().into_inner();
-        let res_to_send = NewOrderRes::from(response);
-        let total_duration = start_time.elapsed().as_millis() as f64;
-        let order_type = if req.is_buy_side {"buy"} else {"sell"};
-        NEW_ORDER_TOTAL_DURATION.with_label_values(&[order_type, &res_to_send.status.to_string()]).observe(total_duration);
+        let response = shared_state.client.new_order(order_request).await;
         REQUEST_COUNTER.inc();
-        Json(res_to_send)
+        match response{
+            Ok(res) => {
+                let res_to_send = NewOrderRes::from(res.into_inner());
+                let total_duration = start_time.elapsed().as_millis() as f64;
+                let order_type = if req.is_buy_side {"buy"} else {"sell"};
+                NEW_ORDER_TOTAL_DURATION.with_label_values(&[order_type, &res_to_send.status.to_string()]).observe(total_duration);
+                Json(res_to_send)
+            }
+            Err(e) => {
+                Json(NewOrderRes{
+                    order_id : "none".to_string(),
+                    status : 400,
+                    order_index : None,
+                    cause : Some(format!("{}",e))
+                })
+            }
+        }
 }
 
 async fn modify_order(
