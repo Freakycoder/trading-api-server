@@ -11,14 +11,14 @@ use clob_engine::order_book::types::{EngineNewOrder, EngineCancelOrder, EngineMo
 use lazy_static::lazy_static;
 use clob_engine::MatchingEngine;
 use prometheus::{HistogramOpts, HistogramVec, IntCounter, Registry, TextEncoder};
-use rtrb::{Producer, RingBuffer};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}, thread, time::Instant
+    collections::HashMap, sync::{Arc, atomic::{AtomicU64, Ordering}}, thread, time::Instant
 };
 use tracing::{Span, field::Empty};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot::{Sender, channel};
+use crossbeam::channel::{Sender as BufferSender, bounded};
+use tokio::sync::oneshot::{channel, Sender as OneshotSender};
 
 lazy_static! {
     static ref NEW_ORDER_TOTAL_DURATION: HistogramVec = HistogramVec::new(
@@ -26,7 +26,7 @@ lazy_static! {
             "new_order_total_duration_ms",
             "total time from http request to response for new order"
         )
-        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]),
+        .buckets(vec![0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0]),
         &["order_type", "status"]
     )
     .unwrap();
@@ -35,7 +35,7 @@ lazy_static! {
             "cancel_order_total_duration_ms",
             "total time from http request to response for cancel order"
         )
-        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]),
+        .buckets(vec![0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0]),
         &["status"]
     )
     .unwrap();
@@ -44,7 +44,7 @@ lazy_static! {
             "modify_order_total_duration_ms",
             "total time from http request to response for modify order"
         )
-        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]),
+        .buckets(vec![0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0]),
         &["status"]
     )
     .unwrap();
@@ -53,7 +53,7 @@ lazy_static! {
             "depth_total_duration_ms",
             "total time from http request to response for depth"
         )
-        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0]),
+        .buckets(vec![0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0]),
         &["asset_name", "status"]
     )
     .unwrap();
@@ -67,11 +67,11 @@ static ORDER_ID_COUNTER : AtomicU64 = AtomicU64::new(1);
 pub struct SharedState {
     pub security_registery : Arc<HashMap<String, u32>>,
     pub registry: Registry,
-    pub producer: Arc<Mutex<Producer<OrderEvent>>>,
+    pub buffer_sender : BufferSender<OrderEvent>
 }
 
 impl SharedState {
-    pub async fn new(producer: Arc<Mutex<Producer<OrderEvent>>>) -> Result<Self, anyhow::Error> {
+    pub async fn new(sender : BufferSender<OrderEvent>) -> Result<Self, anyhow::Error> {
 
         let registry = Registry::new();
         let mut security_registery = HashMap::new();
@@ -81,7 +81,7 @@ impl SharedState {
         Ok(Self {
             security_registery,
             registry,
-            producer,
+            buffer_sender : sender
         })
     }
 }
@@ -96,17 +96,17 @@ impl IntoResponse for OrderError {
 
 #[derive(Debug)]
 pub enum OrderEvent {
-    NewOrder(EngineNewOrder,Span, Sender<NewOrderRes>),
-    ModifyOrder(EngineModifyOrder,Span, Sender<ModifyOrderRes>),
-    CancelOrder(EngineCancelOrder,Span, Sender<CancelOrderRes>),
-    DepthOrder(EngineDepthRequest, Span, Sender<DepthRes>)
+    NewOrder(EngineNewOrder,Span, OneshotSender<Result<NewOrderRes, String>>),
+    ModifyOrder(EngineModifyOrder,Span, OneshotSender<Result<ModifyOrderRes,String>>),
+    CancelOrder(EngineCancelOrder,Span, OneshotSender<Result<CancelOrderRes,String>>),
+    DepthOrder(EngineDepthRequest, Span, OneshotSender<Result<DepthRes, String>>)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let (producer, mut consumer) = RingBuffer::new(1000);
-    let shared_producer = Arc::new(Mutex::new(producer));
-    let shared_state: SharedState = SharedState::new(shared_producer).await?;
+
+    let (sender , consumer) = bounded::<OrderEvent>(1000);
+    let shared_state =  SharedState::new(sender).await?;
     let _ = shared_state
         .registry
         .register(Box::new(NEW_ORDER_TOTAL_DURATION.clone()));
@@ -131,7 +131,7 @@ async fn main() -> Result<(), anyhow::Error> {
     thread::spawn(move || {
         let mut engine = MatchingEngine::new();
         loop {
-            match consumer.pop(){
+            match consumer.recv(){
                 Ok(message) => {
                     match message{
                         OrderEvent::NewOrder(new_order,span ,producer ) => {
@@ -140,38 +140,29 @@ async fn main() -> Result<(), anyhow::Error> {
                                 Ok(potential_index) => {
                                     match potential_index{
                                         Some(index) => {
-                                            let _ = producer.send(NewOrderRes { order_id: order_id.to_string(), status: 200, order_index: Some(index as u32), cause: None });
+                                            let _ = producer.send(Ok(NewOrderRes { order_id: order_id.to_string(), status: 200, order_index: Some(index as u32), cause: None }));
                                         }
                                         None => {
-                                            let _ = producer.send(NewOrderRes { order_id: order_id.to_string(), status: 200, order_index: None, cause: Some("order got consumed by the book".to_string()) });
+                                            let _ = producer.send(Ok(NewOrderRes { order_id: order_id.to_string(), status: 200, order_index: None, cause: Some("order got consumed by the book".to_string()) }));
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = producer.send(NewOrderRes {
-                                        order_id : order_id.to_string(),
-                                        status : 500,
-                                        order_index : None,
-                                        cause : Some(format!("{}",e))
-                                    });
+                                    let _ = producer.send(Err(e.to_string()));
                                 }
                             }
                         }
                         OrderEvent::ModifyOrder(modify_order,span ,producer ) => {
                             match engine.modify(modify_order.order_id, modify_order.security_id, modify_order.new_price, modify_order.new_quantity, modify_order.is_buy_side, &span){
                                 Ok(outcome) => {
-                                    let _ = producer.send(ModifyOrderRes {
+                                    let _ = producer.send(Ok(ModifyOrderRes {
                                         order_id : modify_order.order_id.to_string(),
                                         status : 200,
                                         output : Some(outcome.to_string())
-                                    });
+                                    }));
                                 }
                                 Err(e) => {
-                                    let _ = producer.send(ModifyOrderRes {
-                                        order_id : modify_order.order_id.to_string(),
-                                        status : 500,
-                                        output : Some(format!("{}",e))
-                                    });
+                                    let _ = producer.send(Err(e.to_string()));
                                 }
                             }
                         }
@@ -180,34 +171,30 @@ async fn main() -> Result<(), anyhow::Error> {
                                 Ok(outcome) => {
                                     match outcome {
                                         CancelOutcome::Success => {
-                                            let _ = producer.send(CancelOrderRes {
+                                            let _ = producer.send(Ok(CancelOrderRes {
                                                 order_id : cancel_order.order_id.to_string(),
                                                 status : 200,
                                                 output : Some(format!("order cancelled succesfully"))
-                                            });
+                                            }));
                                         }
                                         CancelOutcome::Failed => {
-                                            let _ = producer.send(CancelOrderRes {
+                                            let _ = producer.send(Ok(CancelOrderRes {
                                                 order_id : cancel_order.order_id.to_string(),
                                                 status : 200,
                                                 output : Some(format!("order consumed or modified"))
-                                            });
+                                            }));
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = producer.send(CancelOrderRes {
-                                        order_id : cancel_order.order_id.to_string(),
-                                        status : 500,
-                                        output : Some(format!("{}",e))
-                                    });
+                                    let _ = producer.send(Err(e.to_string()));
                                 }
                             } 
                         }
                         OrderEvent::DepthOrder(depth_order,span ,producer ) => {
                             match engine.depth(depth_order.security_id, depth_order.level_count, &span){
                                 Ok(outcome) => {
-                                    let _ = producer.send(DepthRes {
+                                    let _ = producer.send(Ok(DepthRes {
                                         status : 200,
                                         ask_depth : outcome.ask_depth.into_iter().map(|level| PriceLevel {
                                             price : level.price_level,
@@ -217,14 +204,10 @@ async fn main() -> Result<(), anyhow::Error> {
                                             price : level.price_level,
                                             quantity : level.quantity
                                         }).collect()
-                                    });
+                                    }));
                                 }
-                                Err(_) => {
-                                    let _ = producer.send(DepthRes{
-                                        status : 500,
-                                        ask_depth : vec![],
-                                        bid_depth : vec![]
-                                    });
+                                Err(e) => {
+                                    let _ = producer.send(Err(e.to_string()));
                                 }
                             }
                         }
@@ -247,7 +230,7 @@ async fn new_order(
     Json(request): Json<NewOrder>,
 ) -> Result<Json<NewOrderRes>, OrderError> {
     let start_time = Instant::now();
-    let (sender, reciever) = channel::<NewOrderRes>(); // ONESHOT channel being created seperately in every fn
+    let (oneshot_sender, reciever) = channel::<Result<NewOrderRes, String>>(); // ONESHOT channel being created seperately in every fn
     let req = request;
     if req.price.is_none() && req.order_type == "limit" {
         return Err(OrderError(anyhow!("Price cannot be 0")));
@@ -291,22 +274,26 @@ async fn new_order(
     REQUEST_COUNTER.inc();
     let order_type = if req.is_buy_side { "buy" } else { "sell" };
 
-    {
-        let mut gaurd = shared_state
-            .producer
-            .lock()
-            .map_err(|e| OrderError(anyhow!("failed to acquire producer lock due to {}", e)))?;
-        gaurd
-            .push(OrderEvent::NewOrder(order_request, match_span, sender))
-            .map_err(|e| OrderError(anyhow!("unable to push into ring-buffer due to {}", e)))?;
-    }
+    let crossbeam_sender = shared_state.buffer_sender;
+    crossbeam_sender.send(OrderEvent::NewOrder(order_request, match_span, oneshot_sender)).map_err(|e| OrderError(anyhow!("{}",e)))?;
+
     match reciever.await {
         Ok(result) => {
             let total_duration = start_time.elapsed().as_millis() as f64;
-            NEW_ORDER_TOTAL_DURATION
+            match result{
+                Ok(message) => {
+                    NEW_ORDER_TOTAL_DURATION
                 .with_label_values(&[order_type, "200"])
                 .observe(total_duration);
-            Ok(Json(result))
+                    return Ok(Json(message))
+                }
+                Err(e) => {
+                    NEW_ORDER_TOTAL_DURATION
+                .with_label_values(&[order_type, "500"])
+                .observe(total_duration);
+                    return Err(OrderError(anyhow!("{}",e)))
+                }
+            }
         }
         Err(e) => {
             let total_duration = start_time.elapsed().as_millis() as f64;
@@ -356,36 +343,33 @@ async fn modify_order(
 
     REQUEST_COUNTER.inc();
 
-    let (sender, receiver) = channel::<ModifyOrderRes>();
-
-    {
-        let mut guard = shared_state
-            .producer
-            .lock()
-            .map_err(|e| OrderError(anyhow!("producer mutex poisoned: {}", e)))?;
-
-        guard
-            .push(OrderEvent::ModifyOrder(
-                EngineModifyOrder {
+    let (oneshot_sender, receiver) = channel::<Result<ModifyOrderRes, String>>();
+    let buffer_sender = shared_state.buffer_sender;
+    buffer_sender.send(OrderEvent::ModifyOrder(EngineModifyOrder {
                     order_id,
                     new_price,
                     new_quantity,
                     is_buy_side: req.is_buy_side,
                     security_id : *security_id
-                },
-                modify_span,
-                sender,
-            ))
-            .map_err(|e| OrderError(anyhow!("ring buffer full: {}", e)))?;
-    } 
+                }, modify_span, oneshot_sender)).map_err(|e| OrderError(anyhow!("{}",e)))?;
 
     match receiver.await {
         Ok(result) => {
             let total_duration = start_time.elapsed().as_millis() as f64;
-            MODIFY_ORDER_TOTAL_DURATION
-                .with_label_values(&[result.status.to_string().as_str()])
+            match result{
+                Ok(message) => {
+                    MODIFY_ORDER_TOTAL_DURATION
+                .with_label_values(&[message.status.to_string().as_str()])
                 .observe(total_duration);
-            Ok(Json(result))
+                    return Ok(Json(message))
+                }
+                Err(e) => {
+                    MODIFY_ORDER_TOTAL_DURATION
+                .with_label_values(&["500"])
+                .observe(total_duration);
+                    return Err(OrderError(anyhow!("{}",e)));
+                }
+            }
         }
         Err(e) => {
             let total_duration = start_time.elapsed().as_millis() as f64;
@@ -414,30 +398,29 @@ async fn cancel_order(
 
     REQUEST_COUNTER.inc();
 
-    let (sender, receiver) = channel::<CancelOrderRes>();
-
-    {
-        let mut guard = shared_state
-            .producer
-            .lock()
-            .map_err(|e| OrderError(anyhow!("producer mutex poisoned: {}", e)))?;
-
-        guard
-            .push(OrderEvent::CancelOrder(
-                EngineCancelOrder { order_id, is_buy_side : req.is_buy_side ,security_id : *security_id },
-                cancel_span,
-                sender,
-            ))
-            .map_err(|e| OrderError(anyhow!("ring buffer full: {}", e)))?;
-    }
+    let (oneshot_sender, receiver) = channel::<Result<CancelOrderRes,String>>();
+    let buffer_sender = shared_state.buffer_sender;
+    buffer_sender.send(OrderEvent::CancelOrder(EngineCancelOrder { order_id, is_buy_side : req.is_buy_side ,security_id : *security_id }, 
+        cancel_span, 
+        oneshot_sender)).map_err(|e| OrderError(anyhow!("{}",e)))?;
 
     match receiver.await {
         Ok(result) => {
             let total_duration = start_time.elapsed().as_millis() as f64;
-            CANCEL_ORDER_TOTAL_DURATION
-                .with_label_values(&[result.status.to_string().as_str()])
+            match result{
+                Ok(message) => {
+                    CANCEL_ORDER_TOTAL_DURATION
+                .with_label_values(&[message.status.to_string().as_str()])
                 .observe(total_duration);
-            Ok(Json(result))
+                    return Ok(Json(message))
+                }
+                Err(e) => {
+                    CANCEL_ORDER_TOTAL_DURATION
+                .with_label_values(&["500"])
+                .observe(total_duration);
+                    return Err(OrderError(anyhow!("{}",e)));
+                }
+            }
         }
         Err(e) => {
             let total_duration = start_time.elapsed().as_millis() as f64;
@@ -468,33 +451,32 @@ async fn depth(
 
     REQUEST_COUNTER.inc();
 
-    let (sender, receiver) = channel::<DepthRes>();
-
-    {
-        let mut guard = shared_state
-            .producer
-            .lock()
-            .map_err(|e| OrderError(anyhow!("producer mutex poisoned: {}", e)))?;
-
-        guard
-            .push(OrderEvent::DepthOrder(
-                EngineDepthRequest {
+    let (oneshot_sender, receiver) = channel::<Result<DepthRes, String>>();
+    let buffer_sender = shared_state.buffer_sender;
+    buffer_sender.send(OrderEvent::DepthOrder(EngineDepthRequest {
                     security_id: *security_id,
-                    level_count,
-                },
-                depth_span,
-                sender,
-            ))
-            .map_err(|e| OrderError(anyhow!("ring buffer full: {}", e)))?;
-    } 
+                    level_count}, 
+                    depth_span, 
+                    oneshot_sender)).map_err(|e| OrderError(anyhow!("{}",e)))?;
 
     match receiver.await {
         Ok(result) => {
             let total_duration = start_time.elapsed().as_millis() as f64;
-            DEPTH_TOTAL_DURATION
-                .with_label_values(&[req.security_name.as_str(), result.status.to_string().as_str()])
+            
+            match result{
+                Ok(message) => {
+                    DEPTH_TOTAL_DURATION
+                .with_label_values(&[req.security_name.as_str(), message.status.to_string().as_str()])
                 .observe(total_duration);
-            Ok(Json(result))
+                    return Ok(Json(message))
+                }
+                Err(e) => {
+                    DEPTH_TOTAL_DURATION
+                .with_label_values(&[req.security_name.as_str(), "500"])
+                .observe(total_duration);
+                    return Err(OrderError(anyhow!("{}",e)));
+                }
+            }
         }
         Err(e) => {
             let total_duration = start_time.elapsed().as_millis() as f64;
